@@ -5,36 +5,49 @@ hook-enforced rules). Keep this file current when the build, layout, or public A
 
 ## What this is
 
-Kubernetes workload identity for gRPC services: verify projected ServiceAccount tokens and enforce a per-method caller allow-list.
+A Go library, package `workloadidentity`, that authenticates gRPC calls between services in one
+Kubernetes cluster. A caller sends its projected ServiceAccount token; the callee verifies it
+against the cluster issuer's JWKS, checks the service account against an allow-list, maps it to a
+caller name, and checks a per-method `Policy` before the handler runs.
 
-<!-- Fill in: what the project does, what it ships (library, service, action, CLI), and the one or
-two things an agent must understand before changing it. -->
+Two things to understand before changing it:
+
+- It is a generic helper. No product names, service names, audiences or token paths are baked
+  in: the caller supplies the issuer, audience, allow-list, token path and caller-name mapping.
+  Keep it that way; a new default must never widen who is accepted.
+- It fails closed. Missing config is a start-up error, a verifier with no key set refuses every
+  call with `Unavailable`, and only `WORKLOAD_AUTH=disabled` turns authentication off.
 
 ## Using go-workload-identity
 
-<!-- If this project is consumed by others (a library/plugin/action), describe the contract a
-consumer must respect: the single entry point, the public surface, required options, and anything
-that must not be bypassed. Delete this section for a leaf application. -->
+- Server: `NewVerifier(Config, logger)` (or `ServerConfigFromEnv`), run `Verifier.Run` in a
+  goroutine, and install `UnaryServerInterceptor` / `StreamServerInterceptor` with a `Policy`.
+  Gate readiness on `Verifier.Ready()`.
+- Client: `NewTokenCredentials(path)` or `DialOptionFromEnv` as a per-RPC credential.
+- Handlers read the verified caller with `GrantFromContext`.
+- `Config.Audience` and `Config.AllowedServiceAccounts` are required. `Config.CallerName` wins
+  over `Config.ServiceAccountPrefix`; with neither, the caller name is the service account name.
+- The only contract with request messages is an optional top-level `actor` message field.
 
 ## Layout
 
-<!-- The directories that matter and what lives in each. Keep it short; point at the entry points. -->
-
-- `src/` - <what>
-- `<tests dir>/` - <what>
+- `doc.go` - package overview
+- `config.go` - `Config`, the `WORKLOAD_*` environment variables, `ConfigFromEnv`
+- `mode.go` - `ServerConfigFromEnv`, the fail-closed `WORKLOAD_AUTH` switch, `WarnDisabled`
+- `verifier.go` - `Verifier`: token checks, allow-list, caller-name mapping, `Ready`
+- `jwks.go` - discovery and JWKS fetch, key cache and refresh
+- `policy.go` - `Policy`, `Access`, `Grant`, the `actor` check
+- `interceptor.go` - the unary and stream server interceptors, deny hook, exemptions
+- `client.go` - per-RPC token credentials and `DialOptionFromEnv`
+- `*_test.go` - unit tests; `issuer_test.go` is a local TLS OIDC issuer with generated keys, and
+  `example_test.go` holds the godoc examples
 
 ## Build, test, lint
 
-<!-- The exact commands. Pull these from package.json scripts (npm), the Taskfile (Go/Task), or
-pyproject (Python) so they stay accurate. -->
-
-- Build: `<command>`
-- Test: `<command>` (note any service/fixture the integration tests require)
-- Lint: `<command>`
-- Package checks (npm packages), after a build: `npm run check:pack` (contents and ceiling),
-  `npm run check:pack:growth` (growth against the last release), `npm run check:install`
-  (install the tarball, import ESM and CJS); see CLAUDE.md "npm package contents"
-- License headers / docs: `<command>`
+- Build: `task build` (`go build ./...`)
+- Test: `task test` (`go test ./...`); hermetic, no cluster or network needed
+- Lint: `task lint` (gofmt check, `golangci-lint run`, `yamllint .`)
+- License headers: `task license` (check) and `task license:fix` (inject the MIT header)
 
 ## Logging
 
@@ -44,11 +57,10 @@ Follow the logging rules in `CLAUDE.md`. In short:
   changes, external calls (target, duration, outcome), and every error with its context.
 - Levels: `trace` for step-by-step detail, `debug` for flow, `info` for lifecycle, `warn` and
   `error` for problems. The environment filters the volume, so err on the side of too much.
-- Environments: local dev `trace` with `LOG_FORMAT=console` (never JSON), dev cluster `debug`,
-  qa/staging `info`, production `error`. Every cluster environment logs JSON. Set levels through
-  `LOG_LEVEL` and `LOG_FORMAT`, never in code; local settings live in the run target or
-  `.env.example`.
-- Never log secrets, tokens, or personal data, not even at `trace`. Log an opaque or keyed ID.
+- The library logs through the `github.com/Bugs5382/go-log` logger it is given; a nil logger
+  discards. It never sets a level or format itself.
+- Never log tokens, secrets, or personal data, not even at `trace`. Log the caller name and
+  service account instead.
 
 ## Conventions and gotchas
 
@@ -56,4 +68,7 @@ Follow the logging rules in `CLAUDE.md`. In short:
   `.claude/hooks` (run `bash .claude/hooks/install.sh` once per clone).
 - Open every PR as a draft. CI skips drafts, so run the full checks locally, push once they pass,
   and mark the PR ready when the work is finished; see CLAUDE.md "CI and Actions minutes".
-- <project-specific conventions, non-obvious constraints, and traps an agent should know>
+- Tests use neutral fixtures only (`apps/app-gateway`, `example.org`); never copy values from a
+  real cluster.
+- Behaviour, config or API changes update `README.md` (usage and the environment table) and
+  `doc.go` in the same PR.
