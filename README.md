@@ -50,7 +50,7 @@ v, err := workloadidentity.NewVerifier(cfg, logger)
 if err != nil {
 	return err
 }
-go v.Run(ctx) // loads the JWKS now, then every 15 minutes
+go v.Run(ctx) // loads the JWKS now (retrying with backoff while the issuer is down), then every 15 minutes
 
 policy := workloadidentity.Policy{
 	"/orders.v1.Orders/GetOrder":    {"gateway": workloadidentity.OnBehalf, "billing": workloadidentity.Self},
