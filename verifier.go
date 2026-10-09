@@ -44,6 +44,11 @@ import (
 const (
 	// DefaultRefreshInterval is how often Run refetches the JWKS.
 	DefaultRefreshInterval = 15 * time.Minute
+	// defaultRetryInitial is the first backoff Run waits before retrying a
+	// first JWKS load that failed.
+	defaultRetryInitial = time.Second
+	// defaultRetryMax caps the backoff between first-load retries.
+	defaultRetryMax        = 30 * time.Second
 	unknownKidRefreshEvery = 30 * time.Second
 	clockSkew              = 60 * time.Second
 	fetchTimeout           = 10 * time.Second
@@ -85,6 +90,11 @@ type Verifier struct {
 	log      log.Logger
 	now      func() time.Time
 	interval time.Duration
+
+	// retryInitial and retryMax bound the backoff Run uses while retrying
+	// the first JWKS load; a test may shorten them.
+	retryInitial time.Duration
+	retryMax     time.Duration
 }
 
 var _ TokenVerifier = (*Verifier)(nil)
@@ -110,11 +120,13 @@ func NewVerifier(cfg Config, logger log.Logger) (*Verifier, error) {
 		}
 	}
 	v := &Verifier{
-		cfg:      cfg,
-		allowed:  make(map[string]struct{}, len(cfg.AllowedServiceAccounts)),
-		log:      logger.With(log.F("component", "workloadidentity")),
-		now:      time.Now,
-		interval: DefaultRefreshInterval,
+		cfg:          cfg,
+		allowed:      make(map[string]struct{}, len(cfg.AllowedServiceAccounts)),
+		log:          logger.With(log.F("component", "workloadidentity")),
+		now:          time.Now,
+		interval:     DefaultRefreshInterval,
+		retryInitial: defaultRetryInitial,
+		retryMax:     defaultRetryMax,
 	}
 	for _, e := range cfg.AllowedServiceAccounts {
 		v.allowed[e] = struct{}{}
@@ -148,9 +160,11 @@ func fetchClient(caFile string) (*http.Client, error) {
 	}, nil
 }
 
-// Run loads the key set now and then every refresh interval until ctx ends.
+// Run loads the key set now, retrying with backoff while the issuer is down
+// so a pod that starts before the issuer is reachable turns ready without a
+// restart, then refetches every refresh interval until ctx ends.
 func (v *Verifier) Run(ctx context.Context) {
-	_ = v.Refresh(ctx)
+	v.loadFirstKeySet(ctx)
 	t := time.NewTicker(v.interval)
 	defer t.Stop()
 	for {
@@ -161,6 +175,49 @@ func (v *Verifier) Run(ctx context.Context) {
 			_ = v.Refresh(ctx)
 		}
 	}
+}
+
+// loadFirstKeySet retries Refresh with exponential backoff until a key set
+// loads or ctx ends. Once a retry was needed, it logs the recovery.
+func (v *Verifier) loadFirstKeySet(ctx context.Context) {
+	delay := v.retryInitial
+	for attempt := 1; ; attempt++ {
+		start := v.now()
+		err := v.Refresh(ctx)
+		dur := v.now().Sub(start)
+		if v.keys.loaded() {
+			if attempt > 1 {
+				v.log.Info("JWKS loaded after retrying the first fetch",
+					log.F("target", v.keys.target()), log.F("attempts", attempt))
+			}
+			return
+		}
+		v.log.Debug("JWKS first fetch not ready yet; will retry",
+			log.F("target", v.keys.target()), log.F("attempt", attempt),
+			log.F("duration_ms", dur.Milliseconds()), log.F("outcome", retryOutcome(err)),
+			log.F("retry_in_ms", delay.Milliseconds()))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = nextRetry(delay, v.retryMax)
+	}
+}
+
+// nextRetry doubles d, capped at max.
+func nextRetry(d, max time.Duration) time.Duration {
+	if d *= 2; d > max {
+		return max
+	}
+	return d
+}
+
+func retryOutcome(err error) string {
+	if err == nil {
+		return "no usable keys"
+	}
+	return err.Error()
 }
 
 // Refresh fetches the key set once. A failure keeps the last good set.

@@ -54,8 +54,24 @@ type testIssuer struct {
 	keys      map[string]any
 	published []string
 
-	jwksHits atomic.Int32
-	fail     atomic.Bool
+	jwksHits      atomic.Int32
+	discoveryHits atomic.Int32
+	fail          atomic.Bool
+	// refuse answers 503 to that many more discovery requests, then serves.
+	refuse atomic.Int32
+}
+
+// refused reports whether this request is one of the refused ones.
+func (i *testIssuer) refused() bool {
+	for {
+		n := i.refuse.Load()
+		if n <= 0 {
+			return false
+		}
+		if i.refuse.CompareAndSwap(n, n-1) {
+			return true
+		}
+	}
 }
 
 func newTestIssuer(t *testing.T) *testIssuer {
@@ -63,6 +79,11 @@ func newTestIssuer(t *testing.T) *testIssuer {
 	i := &testIssuer{keys: map[string]any{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		i.discoveryHits.Add(1)
+		if i.refused() {
+			http.Error(w, "not yet", http.StatusServiceUnavailable)
+			return
+		}
 		if i.fail.Load() {
 			http.Error(w, "down", http.StatusInternalServerError)
 			return

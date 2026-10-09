@@ -104,6 +104,15 @@ func (j *jwksCache) loaded() bool {
 	return j.keys != nil
 }
 
+// target is what a refresh fetches from: the configured JWKS URL override,
+// or the issuer's discovery document when there is none.
+func (j *jwksCache) target() string {
+	if j.override != "" {
+		return j.override
+	}
+	return strings.TrimSuffix(j.issuer, "/") + "/.well-known/openid-configuration"
+}
+
 func (j *jwksCache) refresh(ctx context.Context, rateLimited bool) error {
 	j.fetchMu.Lock()
 	defer j.fetchMu.Unlock()
